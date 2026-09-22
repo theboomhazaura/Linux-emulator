@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>32-bit x86 OS Emulator</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#12161f; --border:#232838; --text:#e6e9f0;
+    --muted:#8a91a6; --accent:#5cc8ff; --accent2:#7effb2; --danger:#ff6b6b;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    min-height:100vh; display:flex; flex-direction:column; align-items:center;
+    padding:24px 16px 60px;
+  }
+  h1{font-size:1.25rem; margin:0 0 4px;}
+  .sub{color:var(--muted); font-size:.85rem; margin-bottom:20px; text-align:center; max-width:640px;}
+  .panel{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:16px; width:100%; max-width:900px; margin-bottom:16px;
+  }
+  .controls{display:flex; flex-wrap:wrap; gap:10px; align-items:center;}
+  select, button{
+    font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--border);
+    background:#1a2030; color:var(--text); cursor:pointer;
+  }
+  button.primary{background:var(--accent); color:#00131c; border-color:var(--accent); font-weight:600;}
+  button.primary:disabled{opacity:.5; cursor:not-allowed;}
+  button.danger{border-color:var(--danger); color:var(--danger); background:transparent;}
+  button:hover:not(:disabled){filter:brightness(1.1);}
+  .status{
+    margin-top:12px; font-size:.8rem; color:var(--muted); white-space:pre-wrap;
+    max-height:90px; overflow-y:auto; font-family:ui-monospace,Menlo,Consolas,monospace;
+    line-height:1.4;
+  }
+  .status b{color:var(--accent2);}
+  #screen-wrap{
+    width:100%; max-width:900px; background:#000; border:1px solid var(--border);
+    border-radius:12px; overflow:hidden; position:relative;
+  }
+  #screen_container{
+    width:100%; min-height:400px; display:flex; align-items:center; justify-content:center;
+    padding:0;
+  }
+  #screen_container canvas{width:100%; height:auto; display:block; image-rendering:pixelated;}
+  #screen_container div{color:#ccc; font:14px ui-monospace,monospace; line-height:14px; padding:8px;}
+  .hint{
+    position:absolute; bottom:8px; right:10px; font-size:.7rem; color:#666;
+    background:rgba(0,0,0,.5); padding:3px 8px; border-radius:6px; pointer-events:none;
+  }
+  .foot{color:var(--muted); font-size:.75rem; max-width:900px; text-align:center; margin-top:10px; line-height:1.5;}
+  a{color:var(--accent);}
+  .progress{height:4px; background:#1a2030; border-radius:2px; overflow:hidden; margin-top:10px; display:none;}
+  .progress-bar{height:100%; width:0%; background:var(--accent); transition:width .2s;}
+</style>
+</head>
+<body>
+ 
+<h1>🖥️ 32-bit x86 OS Emulator</h1>
+<p class="sub">
+  A real x86-compatible CPU, emulated in your browser and running an actual 32-bit
+  operating system — powered by <a href="https://github.com/copy/v86" target="_blank" rel="noopener">v86</a>,
+  which JIT-recompiles x86 machine code to WebAssembly on the fly.
+</p>
+ 
+<div class="panel">
+  <div class="controls">
+    <label for="os-select" style="color:var(--muted); font-size:.85rem;">Boot:</label>
+    <select id="os-select">
+      <option value="kolibri">KolibriOS — tiny 32-bit GUI OS (~1.4MB, boots in seconds)</option>
+      <option value="linux">Linux (Buildroot, 32-bit kernel, console)</option>
+      <option value="freedos">FreeDOS (16/32-bit real-mode DOS)</option>
+    </select>
+    <button id="start-btn" class="primary">▶ Boot it</button>
+    <button id="reset-btn" disabled>⟲ Reset</button>
+    <button id="ctrlaltdel-btn" disabled>Ctrl+Alt+Del</button>
+    <button id="fullscreen-btn" disabled>⛶ Fullscreen</button>
+  </div>
+  <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
+  <div class="status" id="status">Pick an OS and click "Boot it". First boot needs to download the BIOS, CPU core, and disk image from the network (a few MB to ~50MB depending on the OS) — after that it runs entirely client-side.</div>
+</div>
+ 
+<div id="screen-wrap">
+  <div id="screen_container">
+    <div style="white-space:pre;">screen will appear here after boot…</div>
+    <canvas style="display:none"></canvas>
+  </div>
+  <div class="hint" id="click-hint" style="display:none;">click to capture mouse/keyboard · Esc-like release: click outside</div>
+</div>
+ 
+<p class="foot">
+  Everything runs locally in your browser — no data leaves your machine once booted, and nothing is uploaded anywhere.
+  This page loads the v86 emulator engine and OS images from public CDNs (jsdelivr, copy.sh) at runtime, so it needs
+  an internet connection to start. Disk images are in-memory only; nothing is saved when you close the tab.
+</p>
+ 
+<script src="https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js"></script>
+<script>
+"use strict";
+ 
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("start-btn");
+const resetBtn = document.getElementById("reset-btn");
+const cadBtn = document.getElementById("ctrlaltdel-btn");
+const fsBtn = document.getElementById("fullscreen-btn");
+const osSelect = document.getElementById("os-select");
+const screenContainer = document.getElementById("screen_container");
+const screenWrap = document.getElementById("screen-wrap");
+const clickHint = document.getElementById("click-hint");
+const progress = document.getElementById("progress");
+const progressBar = document.getElementById("progress-bar");
+ 
+let emulator = null;
+ 
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  statusEl.innerHTML += `\n[${time}] ${msg}`;
+  statusEl.scrollTop = statusEl.scrollHeight;
+}
+ 
+// v86's official npm package (served via jsdelivr) bundles the wasm core and BIOS files.
+const NPM_BASE = "https://cdn.jsdelivr.net/npm/v86@latest";
+ 
+// Public prebuilt disk/kernel images hosted by the v86 project itself.
+const IMAGE_BASE = "https://k.copy.sh";
+ 
+const OS_CONFIGS = {
+  kolibri: {
+    label: "KolibriOS",
+    memory_size: 64 * 1024 * 1024,
+    vga_memory_size: 8 * 1024 * 1024,
+    hda: { url: `${IMAGE_BASE}/kolibri.img`, async: true },
+  },
+  linux: {
+    label: "Linux (Buildroot)",
+    memory_size: 128 * 1024 * 1024,
+    vga_memory_size: 8 * 1024 * 1024,
+    bzimage: { url: `${IMAGE_BASE}/buildroot-bzimage.bin`, async: true },
+    cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+  },
+  freedos: {
+    label: "FreeDOS",
+    memory_size: 32 * 1024 * 1024,
+    vga_memory_size: 4 * 1024 * 1024,
+    fda: { url: `${IMAGE_BASE}/freedos722.img`, async: true },
+  },
+};
+ 
+function setBooted(booted) {
+  startBtn.disabled = booted;
+  osSelect.disabled = booted;
+  resetBtn.disabled = !booted;
+  cadBtn.disabled = !booted;
+  fsBtn.disabled = !booted;
+  clickHint.style.display = booted ? "block" : "none";
+}
+ 
+function boot() {
+  if (typeof V86 === "undefined") {
+    log("<b>Error:</b> the v86 engine failed to load from the CDN. Check your connection and reload the page.");
+    return;
+  }
+ 
+  const key = osSelect.value;
+  const cfg = OS_CONFIGS[key];
+  statusEl.innerHTML = "";
+  log(`Booting <b>${cfg.label}</b>…`);
+  log("Downloading CPU core (WASM), BIOS, and disk image — this can take a moment.");
+  progress.style.display = "block";
+  startBtn.disabled = true;
+ 
+  try {
+    emulator = new V86({
+      screen_container: screenContainer,
+      wasm_path: `${NPM_BASE}/build/v86.wasm`,
+      bios: { url: `${NPM_BASE}/bios/seabios.bin` },
+      vga_bios: { url: `${NPM_BASE}/bios/vgabios.bin` },
+      memory_size: cfg.memory_size,
+      vga_memory_size: cfg.vga_memory_size,
+      hda: cfg.hda,
+      fda: cfg.fda,
+      bzimage: cfg.bzimage,
+      cmdline: cfg.cmdline,
+      autostart: true,
+    });
+  } catch (e) {
+    log(`<b>Failed to start:</b> ${e.message}`);
+    startBtn.disabled = false;
+    return;
+  }
+ 
+  emulator.add_listener("emulator-loaded", () => {
+    log("Emulator core loaded. Booting guest OS…");
+  });
+ 
+  emulator.add_listener("download-progress", (e) => {
+    if (e.file_name && e.loaded && e.total) {
+      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+      progressBar.style.width = pct + "%";
+    }
+  });
+ 
+  emulator.add_listener("emulator-started", () => {
+    log(`<b>${cfg.label} is running.</b> Click the screen to capture keyboard/mouse input.`);
+    progress.style.display = "none";
+    setBooted(true);
+  });
+ 
+  screenContainer.onclick = () => {
+    if (emulator) emulator.lock_mouse();
+  };
+}
+ 
+startBtn.addEventListener("click", boot);
+ 
+resetBtn.addEventListener("click", () => {
+  if (!emulator) return;
+  log("Restarting…");
+  emulator.restart();
+});
+ 
+cadBtn.addEventListener("click", () => {
+  if (!emulator) return;
+  emulator.keyboard_send_scancodes([0x1d, 0x38, 0x53, 0xd3, 0xb8, 0x9d]); // Ctrl+Alt+Del
+  log("Sent Ctrl+Alt+Del.");
+});
+ 
+fsBtn.addEventListener("click", () => {
+  if (screenWrap.requestFullscreen) screenWrap.requestFullscreen();
+});
+</script>
+</body>
+</html>
