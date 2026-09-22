@@ -72,15 +72,35 @@
     <select id="os-select">
       <option value="kolibri">KolibriOS — tiny 32-bit GUI OS (~1.4MB, boots in seconds)</option>
       <option value="linux">Linux (Buildroot, 32-bit kernel, console)</option>
-      <option value="freedos">FreeDOS (16/32-bit real-mode DOS)</option>
+      <option value="freedos">FreeDOS — embedded, works fully offline</option>
     </select>
     <button id="start-btn" class="primary">▶ Boot it</button>
     <button id="reset-btn" disabled>⟲ Reset</button>
     <button id="ctrlaltdel-btn" disabled>Ctrl+Alt+Del</button>
     <button id="fullscreen-btn" disabled>⛶ Fullscreen</button>
+    <button id="clear-cache-btn" style="margin-left:auto;">🗑 Clear offline cache</button>
   </div>
-  <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
-  <div class="status" id="status">Pick an OS and click "Boot it". First boot needs to download the BIOS, CPU core, and disk image from the network (a few MB to ~50MB depending on the OS) — after that it runs entirely client-side.</div>
+  <div class="status" id="status">This build has the CPU core, BIOS, and FreeDOS embedded — pick FreeDOS and click "Boot it" and it works with zero network, ever. KolibriOS and Linux still download their disk image once, then are cached for offline use after that.</div>
+</div>
+ 
+<div class="panel">
+  <div class="controls" style="margin-bottom:2px;">
+    <label style="color:var(--muted); font-size:.85rem;">Or boot your own image:</label>
+  </div>
+  <div class="controls">
+    <input type="file" id="file-input" />
+    <select id="disk-type">
+      <option value="cdrom">CD-ROM (.iso)</option>
+      <option value="hda">Hard disk (.img)</option>
+      <option value="fda">Floppy (.img)</option>
+    </select>
+    <span id="file-name" style="color:var(--muted); font-size:.8rem;"></span>
+  </div>
+  <div class="foot" style="text-align:left; margin-top:8px;">
+    File never leaves your browser — it's read locally and handed straight to the emulator as an in-memory buffer.
+    Pick the right disk type: a Linux/Windows install ISO → "CD-ROM"; a raw hard-disk image → "Hard disk";
+    a boot floppy → "Floppy". Selecting a file overrides the preset dropdown above.
+  </div>
 </div>
  
 <div id="screen-wrap">
@@ -93,33 +113,108 @@
  
 <p class="foot">
   Everything runs locally in your browser — no data leaves your machine once booted, and nothing is uploaded anywhere.
-  This page loads the v86 emulator engine and OS images from public CDNs (jsdelivr, copy.sh) at runtime, so it needs
-  an internet connection to start. Disk images are in-memory only; nothing is saved when you close the tab.
+  The v86 CPU core, BIOS, and the FreeDOS image are embedded directly in this HTML file (as base64), so booting FreeDOS
+  works with zero network, ever — even opened straight from disk with no connection at all. KolibriOS and Linux are
+  larger, so they still download their disk image from k.copy.sh the first time and are cached in your browser's
+  Cache Storage after that (offline from then on, until you clear site data). Uploaded ISO/IMG files never touch the
+  network; they're read straight from disk into memory.
 </p>
  
-<script src="https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js"></script>
+<script>__LIBV86_JS__</script>
 <script>
 "use strict";
+ 
+// --- Embedded, offline copies of the v86 engine core (filled in by build-offline.js) ---
+// These are base64 strings baked directly into this file, so no network is needed for them.
+const V86_WASM_B64 = "__V86_WASM_B64__";
+const SEABIOS_B64 = "__SEABIOS_B64__";
+const VGABIOS_B64 = "__VGABIOS_B64__";
+// FreeDOS is small enough to embed too, so at least one OS boots with zero network, ever.
+const FREEDOS_B64 = "__FREEDOS_B64__";
+ 
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
  
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start-btn");
 const resetBtn = document.getElementById("reset-btn");
 const cadBtn = document.getElementById("ctrlaltdel-btn");
 const fsBtn = document.getElementById("fullscreen-btn");
+const clearCacheBtn = document.getElementById("clear-cache-btn");
 const osSelect = document.getElementById("os-select");
 const screenContainer = document.getElementById("screen_container");
 const screenWrap = document.getElementById("screen-wrap");
 const clickHint = document.getElementById("click-hint");
-const progress = document.getElementById("progress");
-const progressBar = document.getElementById("progress-bar");
+const fileInput = document.getElementById("file-input");
+const diskTypeSelect = document.getElementById("disk-type");
+const fileNameEl = document.getElementById("file-name");
  
 let emulator = null;
+let customFile = null; // { buffer: ArrayBuffer, type: "cdrom"|"hda"|"fda", name: string }
+ 
+// All CPU core / BIOS / OS-image bytes are cached here after first download, so
+// repeat boots (even offline) don't need the network. Uploaded files never go
+// through this cache — they're already local.
+const CACHE_NAME = "v86-emulator-assets-v1";
  
 function log(msg) {
   const time = new Date().toLocaleTimeString();
   statusEl.innerHTML += `\n[${time}] ${msg}`;
   statusEl.scrollTop = statusEl.scrollHeight;
 }
+ 
+async function cachedFetch(url, label) {
+  let cache = null;
+  try {
+    if ("caches" in window) cache = await caches.open(CACHE_NAME);
+  } catch (e) {
+    // Cache Storage unavailable (e.g. private browsing) — fall back to a plain fetch.
+  }
+ 
+  if (cache) {
+    const hit = await cache.match(url);
+    if (hit) {
+      log(`${label}: loaded from offline cache.`);
+      return await hit.arrayBuffer();
+    }
+  }
+ 
+  log(`${label}: downloading (will be cached for offline use next time)…`);
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${label} download failed (HTTP ${resp.status})`);
+  const cacheable = cache ? resp.clone() : null;
+  const buf = await resp.arrayBuffer();
+ 
+  if (cache) {
+    try { await cache.put(url, cacheable); }
+    catch (e) { /* e.g. storage quota exceeded — non-fatal, just won't be cached */ }
+  }
+  return buf;
+}
+ 
+fileInput.addEventListener("change", async () => {
+  const f = fileInput.files[0];
+  if (!f) { customFile = null; fileNameEl.textContent = ""; return; }
+  fileNameEl.textContent = `${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB) — reading…`;
+  try {
+    const buffer = await f.arrayBuffer();
+    customFile = { buffer, type: diskTypeSelect.value, name: f.name };
+    fileNameEl.textContent = `${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB) ready`;
+    log(`Loaded local file <b>${f.name}</b> — will boot as ${diskTypeSelect.options[diskTypeSelect.selectedIndex].text}.`);
+  } catch (e) {
+    fileNameEl.textContent = "failed to read file";
+    log(`<b>Couldn't read file:</b> ${e.message}`);
+    customFile = null;
+  }
+});
+ 
+diskTypeSelect.addEventListener("change", () => {
+  if (customFile) customFile.type = diskTypeSelect.value;
+});
  
 // v86's official npm package (served via jsdelivr) bundles the wasm core and BIOS files.
 const NPM_BASE = "https://cdn.jsdelivr.net/npm/v86@latest";
@@ -132,62 +227,97 @@ const OS_CONFIGS = {
     label: "KolibriOS",
     memory_size: 64 * 1024 * 1024,
     vga_memory_size: 8 * 1024 * 1024,
-    hda: { url: `${IMAGE_BASE}/kolibri.img`, async: true },
+    field: "hda",
+    url: `${IMAGE_BASE}/kolibri.img`,
   },
   linux: {
     label: "Linux (Buildroot)",
     memory_size: 128 * 1024 * 1024,
     vga_memory_size: 8 * 1024 * 1024,
-    bzimage: { url: `${IMAGE_BASE}/buildroot-bzimage.bin`, async: true },
+    field: "bzimage",
+    url: `${IMAGE_BASE}/buildroot-bzimage.bin`,
     cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
   },
   freedos: {
     label: "FreeDOS",
     memory_size: 32 * 1024 * 1024,
     vga_memory_size: 4 * 1024 * 1024,
-    fda: { url: `${IMAGE_BASE}/freedos722.img`, async: true },
+    field: "fda",
+    url: `${IMAGE_BASE}/freedos722.img`,
   },
 };
  
 function setBooted(booted) {
   startBtn.disabled = booted;
   osSelect.disabled = booted;
+  fileInput.disabled = booted;
+  diskTypeSelect.disabled = booted;
   resetBtn.disabled = !booted;
   cadBtn.disabled = !booted;
   fsBtn.disabled = !booted;
   clickHint.style.display = booted ? "block" : "none";
 }
  
-function boot() {
+async function boot() {
   if (typeof V86 === "undefined") {
-    log("<b>Error:</b> the v86 engine failed to load from the CDN. Check your connection and reload the page.");
+    log("<b>Error:</b> the embedded v86 engine failed to initialize. This build should not need a network connection — if you're seeing this, the embedded libv86.js may not have been injected correctly by the build script.");
     return;
   }
  
-  const key = osSelect.value;
-  const cfg = OS_CONFIGS[key];
   statusEl.innerHTML = "";
-  log(`Booting <b>${cfg.label}</b>…`);
-  log("Downloading CPU core (WASM), BIOS, and disk image — this can take a moment.");
-  progress.style.display = "block";
   startBtn.disabled = true;
  
+  let label = "";
+ 
   try {
-    emulator = new V86({
+    // Engine core (WASM + BIOSes) is embedded in this file — instant, zero network.
+    const wasmBuf = base64ToArrayBuffer(V86_WASM_B64);
+    const biosBuf = base64ToArrayBuffer(SEABIOS_B64);
+    const vgaBiosBuf = base64ToArrayBuffer(VGABIOS_B64);
+    log("CPU core, BIOS, and VGA BIOS loaded from the embedded copy in this file (no network used).");
+ 
+    const baseConfig = {
       screen_container: screenContainer,
-      wasm_path: `${NPM_BASE}/build/v86.wasm`,
-      bios: { url: `${NPM_BASE}/bios/seabios.bin` },
-      vga_bios: { url: `${NPM_BASE}/bios/vgabios.bin` },
-      memory_size: cfg.memory_size,
-      vga_memory_size: cfg.vga_memory_size,
-      hda: cfg.hda,
-      fda: cfg.fda,
-      bzimage: cfg.bzimage,
-      cmdline: cfg.cmdline,
+      wasm_fn: async (imports) => (await WebAssembly.instantiate(wasmBuf, imports)).instance.exports,
+      bios: { buffer: biosBuf },
+      vga_bios: { buffer: vgaBiosBuf },
       autostart: true,
-    });
+    };
+ 
+    if (customFile) {
+      label = customFile.name;
+      log(`Booting from local file <b>${customFile.name}</b> as ${customFile.type} — already in memory, no download needed for the disk image itself.`);
+      Object.assign(baseConfig, {
+        memory_size: 256 * 1024 * 1024,
+        vga_memory_size: 8 * 1024 * 1024,
+        [customFile.type]: { buffer: customFile.buffer },
+      });
+    } else if (osSelect.value === "freedos") {
+      // Also embedded — this option boots with zero network, ever, even the first time.
+      label = OS_CONFIGS.freedos.label;
+      log(`Booting <b>${label}</b> from the embedded floppy image (no network used).`);
+      const diskBuf = base64ToArrayBuffer(FREEDOS_B64);
+      Object.assign(baseConfig, {
+        memory_size: OS_CONFIGS.freedos.memory_size,
+        vga_memory_size: OS_CONFIGS.freedos.vga_memory_size,
+        fda: { buffer: diskBuf },
+      });
+    } else {
+      const cfg = OS_CONFIGS[osSelect.value];
+      label = cfg.label;
+      log(`Booting <b>${cfg.label}</b>…`);
+      const diskBuf = await cachedFetch(cfg.url, `${cfg.label} disk image`);
+      Object.assign(baseConfig, {
+        memory_size: cfg.memory_size,
+        vga_memory_size: cfg.vga_memory_size,
+        cmdline: cfg.cmdline,
+        [cfg.field]: { buffer: diskBuf },
+      });
+    }
+ 
+    emulator = new V86(baseConfig);
   } catch (e) {
-    log(`<b>Failed to start:</b> ${e.message}`);
+    log(`<b>Failed to start:</b> ${e.message}${navigator.onLine === false ? " (you appear to be offline, and this asset wasn't cached yet)" : ""}`);
     startBtn.disabled = false;
     return;
   }
@@ -196,16 +326,8 @@ function boot() {
     log("Emulator core loaded. Booting guest OS…");
   });
  
-  emulator.add_listener("download-progress", (e) => {
-    if (e.file_name && e.loaded && e.total) {
-      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
-      progressBar.style.width = pct + "%";
-    }
-  });
- 
   emulator.add_listener("emulator-started", () => {
-    log(`<b>${cfg.label} is running.</b> Click the screen to capture keyboard/mouse input.`);
-    progress.style.display = "none";
+    log(`<b>${label} is running.</b> Click the screen to capture keyboard/mouse input.`);
     setBooted(true);
   });
  
@@ -230,6 +352,15 @@ cadBtn.addEventListener("click", () => {
  
 fsBtn.addEventListener("click", () => {
   if (screenWrap.requestFullscreen) screenWrap.requestFullscreen();
+});
+ 
+clearCacheBtn.addEventListener("click", async () => {
+  try {
+    await caches.delete(CACHE_NAME);
+    log("Offline cache cleared. Next boot of any OS will re-download its assets.");
+  } catch (e) {
+    log(`Couldn't clear cache: ${e.message}`);
+  }
 });
 </script>
 </body>
